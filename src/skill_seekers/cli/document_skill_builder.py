@@ -297,11 +297,25 @@ class DocumentSkillBuilder(SkillConverter):
         # Add images
         images = section.get("images", [])
         if images:
-            assets_dir = os.path.join(self.skill_dir, "assets")
-            os.makedirs(assets_dir, exist_ok=True)
+            # Web-scraped images carry a remote src and no downloaded bytes;
+            # emit the URL as a markdown link so nothing lands on disk.
+            # PDF-extracted images carry bytes and get written to assets/.
+            remote = [img for img in images if not img.get("data") and img.get("src")]
+            local = [img for img in images if img.get("data")]
 
-            f.write("### Images\n\n")
-            for img in images:
+            assets_dir = ""
+            if local:
+                assets_dir = os.path.join(self.skill_dir, "assets")
+                os.makedirs(assets_dir, exist_ok=True)
+
+            if remote or local:
+                f.write("### Images\n\n")
+
+            for img in remote:
+                label = img.get("alt") or img.get("title") or f"Image {img.get('index', 0)}"
+                f.write(f"![{label}]({img['src']})\n\n")
+
+            for img in local:
                 img_index = img.get("index", 0)
                 img_data = img.get("data", b"")
                 img_filename = f"section_{sec_num}_img_{img_index}.png"

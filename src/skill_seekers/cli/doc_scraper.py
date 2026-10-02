@@ -81,6 +81,7 @@ _WHITESPACE_RE = re.compile(r"\s+")
 _SAFE_TITLE_RE = re.compile(r"[^\w\s-]")
 _SAFE_TITLE_SEP_RE = re.compile(r"[-\s]+")
 _DISPLAY_NAME_RE = re.compile(r"[^a-zA-Z0-9_-]+")
+_DECORATIVE_IMG_RE = re.compile(r"(?:^|[\W_])(logo|share|icon|banner)s?(?:[\W_]|$)", re.IGNORECASE)
 
 # Tracking / analytics query params that don't change page content. Stripping
 # them before dedup stops the same page being crawled once per tracking variant
@@ -295,10 +296,14 @@ class DocToSkillConverter(SkillConverter):
         self.visited_urls: set[str] = set()
         # Support multiple starting URLs
         start_urls = normalized_config.get("start_urls", [self.base_url])
+        self.start_urls: list[str] = list(start_urls)
         self.pending_urls = deque(start_urls)
         self._enqueued_urls: set[str] = set(
             start_urls
         )  # Track all ever-enqueued URLs for O(1) dedup
+        self._expansions_count: int = 0
+        self._last_expansion_pending: int = len(self.pending_urls)
+        self.coverage_warnings: list[str] = []
         self.pages: list[dict[str, Any]] = []
         self.pages_scraped = 0
         self.pages_saved = 0
@@ -331,7 +336,7 @@ class DocToSkillConverter(SkillConverter):
         if self.resume and not self.dry_run:
             self.load_checkpoint()
 
-    def _enqueue_url(self, url: str) -> None:
+    def _enqueue_url(self, url: str) -> bool:
         """Add a URL to the pending queue if not already visited or enqueued (O(1)).
 
         Applies :func:`sanitize_url` to percent-encode square brackets before
@@ -340,11 +345,16 @@ class DocToSkillConverter(SkillConverter):
         dry-run, which bypasses extract_content's normalization — dedupes
         tracking-param variants (?utm_*, fbclid, …) the same way the real
         crawl does.
+
+        Returns:
+            bool: True if url was newly added to the pending queue, False otherwise.
         """
         url = _normalize_url(sanitize_url(url))
         if url not in self.visited_urls and url not in self._enqueued_urls:
             self._enqueued_urls.add(url)
             self.pending_urls.append(url)
+            return True
+        return False
 
     def is_valid_url(self, url: str) -> bool:
         """Check if URL should be scraped based on patterns.
@@ -481,6 +491,7 @@ class DocToSkillConverter(SkillConverter):
             "code_samples": [],
             "patterns": [],  # NEW: Extract common patterns
             "links": [],
+            "images": [],
         }
 
         selectors = self.config.get("selectors", {})
@@ -504,8 +515,30 @@ class DocToSkillConverter(SkillConverter):
                 seen_links.add(href)
                 page["links"].append(href)
 
-        # Find main content using shared fallback logic
+        # Extract content images. Scoped to main content when available so we
+        # skip site chrome (logos, share buttons, nav icons) that would
+        # otherwise dominate the image list on every page.
         main, _selector_used = self._find_main_content(soup)
+        _img_scope = main if main is not None else soup
+        _seen_img: set[str] = set()
+        for idx, img_elem in enumerate(_img_scope.find_all("img")):
+            raw_src = img_elem.get("src") or img_elem.get("data-src") or ""
+            if not raw_src:
+                continue
+            src = urljoin(url, str(raw_src).strip())
+            if src.startswith("data:"):
+                continue
+            if src in _seen_img:
+                continue
+            _seen_img.add(src)
+            page["images"].append(
+                {
+                    "index": idx,
+                    "src": src,
+                    "alt": self.clean_text(img_elem.get("alt", "")),
+                    "title": self.clean_text(img_elem.get("title", "")),
+                }
+            )
 
         if not main:
             logger.warning("⚠ No content: %s", url)
@@ -1041,14 +1074,24 @@ class DocToSkillConverter(SkillConverter):
                     logger.info("  %s", url)
                     self.save_page(page)
                     self.pages.append(page)
+                    new_enqueued = 0
                     for link in page["links"]:
-                        self._enqueue_url(link)
+                        if self._enqueue_url(link):
+                            new_enqueued += 1
+                    if new_enqueued > 0:
+                        self._expansions_count += 1
+                        self._last_expansion_pending = len(self.pending_urls)
             else:
                 logger.info("  %s", url)
                 self.save_page(page)
                 self.pages.append(page)
+                new_enqueued = 0
                 for link in page["links"]:
-                    self._enqueue_url(link)
+                    if self._enqueue_url(link):
+                        new_enqueued += 1
+                if new_enqueued > 0:
+                    self._expansions_count += 1
+                    self._last_expansion_pending = len(self.pending_urls)
 
             # Rate limiting
             rate_limit = self.config.get("rate_limit")
@@ -1110,8 +1153,13 @@ class DocToSkillConverter(SkillConverter):
                 self.pages.append(page)
 
                 # Add new URLs
+                new_enqueued = 0
                 for link in page["links"]:
-                    self._enqueue_url(link)
+                    if self._enqueue_url(link):
+                        new_enqueued += 1
+                if new_enqueued > 0:
+                    self._expansions_count += 1
+                    self._last_expansion_pending = len(self.pending_urls)
 
                 # Rate limiting
                 rate_limit = self.config.get("rate_limit")
@@ -1872,6 +1920,69 @@ class DocToSkillConverter(SkillConverter):
                     int(skip_ratio * 100),
                 )
 
+        # Coverage warning check (anti-silent-truncation)
+        self._check_coverage()
+
+    def _check_coverage(self) -> list[str]:
+        """Check crawling coverage and issue actionable warnings on silent truncation.
+
+        Compares scraped page count, seed URL count, and pending queue size.
+        """
+        warnings: list[str] = []
+        scraped_pages = len(self.pages)
+        seed_count = len(self.start_urls)
+        remaining_pending = len(self.pending_urls)
+
+        max_pages = self.config.get("max_pages", DEFAULT_MAX_PAGES)
+        has_page_limit = max_pages not in (-1, None)
+
+        # Configurable minimum expected pages threshold (defaults to 10)
+        min_pages = self.config.get(
+            "min_pages",
+            self.config.get("min_expected_pages", 10),
+        )
+
+        # 1. Single seed URL and scraped pages < absolute lower bound
+        if seed_count == 1 and scraped_pages < min_pages:
+            msg = (
+                f"⚠️  Coverage warning: Crawled only {scraped_pages} page(s) from 1 seed URL "
+                f"(expected at least {min_pages}). The crawl may only have covered a partial "
+                f"section of the site. Consider configuring additional start_urls or run "
+                f"'skill-seekers discover <source>' to find all URLs."
+            )
+            warnings.append(msg)
+            logger.warning(msg)
+
+        # 2. Queue still has unvisited URLs remaining when crawler stopped
+        if remaining_pending > 0:
+            msg = (
+                f"⚠️  Coverage warning: Crawl stopped with {remaining_pending} unvisited URL(s) "
+                f"remaining in queue ({scraped_pages} pages scraped). The site may have "
+                f"pagination or sections not covered; run 'skill-seekers discover <source>' "
+                f"to export the complete URL list."
+            )
+            warnings.append(msg)
+            logger.warning(msg)
+
+        # 3. Far fewer pages than max_pages and no BFS expansion occurred
+        if (
+            (not has_page_limit or scraped_pages < max_pages)
+            and self._expansions_count == 0
+            and scraped_pages > 0
+        ):
+            limit_str = f"max_pages={max_pages}" if has_page_limit else "unlimited mode"
+            msg = (
+                f"⚠️  Coverage warning: Link discovery mechanism did not find any new URLs "
+                f"({scraped_pages} page(s) scraped, {limit_str}, 0 expansions). Only seed URLs "
+                f"were crawled. Verify that url_patterns (include/exclude) or selectors are "
+                f"not filtering out links, or try --browser if links require JavaScript rendering."
+            )
+            warnings.append(msg)
+            logger.warning(msg)
+
+        self.coverage_warnings = warnings
+        return warnings
+
     def save_summary(self) -> None:
         """Save scraping summary"""
         summary = {
@@ -1881,6 +1992,7 @@ class DocToSkillConverter(SkillConverter):
             "llms_txt_detected": self.llms_txt_detected,
             "llms_txt_variant": self.llms_txt_variant,
             "pages": [{"title": p["title"], "url": p["url"]} for p in self.pages],
+            "coverage_warnings": self.coverage_warnings,
         }
 
         try:
@@ -2062,6 +2174,33 @@ class DocToSkillConverter(SkillConverter):
                     lines.append(f"```{lang}")
                     lines.append(code)  # Full code, no truncation
                     lines.append("```\n")
+
+            # Remote content images
+            raw_images = page.get("images", [])
+            valid_images = []
+            for img in raw_images:
+                if not isinstance(img, dict):
+                    continue
+                if img.get("data") or not img.get("src"):
+                    continue
+                src = str(img["src"]).strip()
+                alt = str(img.get("alt") or "").strip()
+                title = str(img.get("title") or "").strip()
+                if _DECORATIVE_IMG_RE.search(f"{src} {alt} {title}"):
+                    continue
+                valid_images.append((img, src, alt, title))
+
+            if valid_images:
+                lines.append("### Images\n")
+                for img, src, alt, title in valid_images:
+                    label = alt or title or f"Image {img.get('index', 0)}"
+                    clean_label = (
+                        re.sub(r"[\r\n]+", " ", str(label))
+                        .replace("[", "(")
+                        .replace("]", ")")
+                        .strip()
+                    )
+                    lines.append(f"![{clean_label}]({src})\n")
 
             lines.append("---\n")
 
@@ -2304,6 +2443,13 @@ To refresh this skill with updated documentation:
         self.create_enhanced_skill_md(categories, quick_ref)
 
         logger.info("\n✅ Skill built: %s/", self.skill_dir)
+        if self.coverage_warnings:
+            logger.warning("\n" + "=" * 60)
+            logger.warning("⚠️  COVERAGE WARNING SUMMARY")
+            logger.warning("=" * 60)
+            for warning in self.coverage_warnings:
+                logger.warning(warning)
+            logger.warning("=" * 60 + "\n")
         return True
 
 

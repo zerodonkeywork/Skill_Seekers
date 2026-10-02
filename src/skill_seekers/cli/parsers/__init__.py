@@ -27,6 +27,7 @@ from .workflows_parser import WorkflowsParser
 from .sync_config_parser import SyncConfigParser
 from .doctor_parser import DoctorParser
 from .detect_parser import DetectParser
+from .discover_parser import DiscoverParser
 from .scan_parser import ScanParser
 from .ui_parser import UiParser
 
@@ -34,6 +35,7 @@ from .ui_parser import UiParser
 PARSERS = [
     CreateParser(),
     DetectParser(),
+    DiscoverParser(),
     ScanParser(),
     DoctorParser(),
     ConfigParser(),

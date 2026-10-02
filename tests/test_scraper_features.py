@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import unittest
+import shutil
 
 from bs4 import BeautifulSoup
 
@@ -903,6 +904,185 @@ class TestNormalizeUrl(unittest.TestCase):
             self._normalize_url("https://x.io/p?b=2&a=1&utm_medium=x"),
             "https://x.io/p?a=1&b=2",
         )
+
+
+class TestCreateReferenceFileImages(unittest.TestCase):
+    """Test image output in DocToSkillConverter.create_reference_file()"""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.config = {
+            "name": "img_test",
+            "base_url": "https://example.com/",
+            "output_dir": self.temp_dir,
+        }
+        self.converter = DocToSkillConverter(self.config)
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_remote_images_output_to_reference(self):
+        pages = [
+            {
+                "title": "Article With Images",
+                "url": "https://example.com/article/1",
+                "content": "Article body text.",
+                "images": [
+                    {
+                        "index": 0,
+                        "src": "https://example.com/upload/photo1.jpg",
+                        "alt": "Chart 1",
+                        "title": "",
+                    },
+                    {
+                        "index": 1,
+                        "src": "https://example.com/upload/photo2.png",
+                        "alt": "",
+                        "title": "Chart 2",
+                    },
+                    {
+                        "index": 2,
+                        "src": "https://example.com/upload/photo3.png",
+                        "alt": "",
+                        "title": "",
+                    },
+                ],
+            }
+        ]
+        self.converter.create_reference_file("articles", pages)
+
+        ref_file = os.path.join(self.converter.skill_dir, "references", "articles.md")
+        self.assertTrue(os.path.exists(ref_file))
+        with open(ref_file, encoding="utf-8") as f:
+            content = f.read()
+
+        self.assertIn("### Images", content)
+        self.assertIn("![Chart 1](https://example.com/upload/photo1.jpg)", content)
+        self.assertIn("![Chart 2](https://example.com/upload/photo2.png)", content)
+        self.assertIn("![Image 2](https://example.com/upload/photo3.png)", content)
+
+    def test_decorative_images_filtered(self):
+        pages = [
+            {
+                "title": "Article With Mixed Images",
+                "url": "https://example.com/article/2",
+                "content": "Content text.",
+                "images": [
+                    {
+                        "index": 0,
+                        "src": "https://example.com/images/logo.svg",
+                        "alt": "Site Logo",
+                    },
+                    {
+                        "index": 1,
+                        "src": "https://example.com/banner/promo.jpg",
+                        "alt": "Promo Banner",
+                    },
+                    {
+                        "index": 2,
+                        "src": "https://example.com/icons/share-fb.png",
+                        "alt": "Share on Facebook",
+                    },
+                    {
+                        "index": 3,
+                        "src": "https://example.com/content/real_chart.png",
+                        "alt": "Real Financial Chart",
+                    },
+                ],
+            }
+        ]
+        self.converter.create_reference_file("mixed", pages)
+
+        ref_file = os.path.join(self.converter.skill_dir, "references", "mixed.md")
+        with open(ref_file, encoding="utf-8") as f:
+            content = f.read()
+
+        self.assertIn("### Images", content)
+        self.assertIn(
+            "![Real Financial Chart](https://example.com/content/real_chart.png)", content
+        )
+        self.assertNotIn("logo.svg", content)
+        self.assertNotIn("promo.jpg", content)
+        self.assertNotIn("share-fb.png", content)
+
+    def test_no_images_header_when_only_decorative_or_no_images(self):
+        pages = [
+            {
+                "title": "Text Only Article",
+                "url": "https://example.com/article/3",
+                "content": "Only text.",
+                "images": [
+                    {
+                        "index": 0,
+                        "src": "https://example.com/logo.png",
+                        "alt": "Logo",
+                    }
+                ],
+            }
+        ]
+        self.converter.create_reference_file("text_only", pages)
+
+        ref_file = os.path.join(self.converter.skill_dir, "references", "text_only.md")
+        with open(ref_file, encoding="utf-8") as f:
+            content = f.read()
+
+        self.assertNotIn("### Images", content)
+class TestCoverageWarning(unittest.TestCase):
+    """Test coverage warning logic in DocToSkillConverter."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.config = {
+            "name": "coverage_test",
+            "base_url": "https://example.com/",
+            "output_dir": self.temp_dir,
+            "min_pages": 10,
+        }
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_warning_when_single_seed_below_min_pages(self):
+        converter = DocToSkillConverter(self.config, dry_run=True)
+        converter.start_urls = ["https://example.com/"]
+        converter.pages = [{"url": f"https://example.com/p{i}", "title": f"P{i}"} for i in range(3)]
+        converter.pending_urls.clear()
+        converter._expansions_count = 1
+
+        warnings = converter._check_coverage()
+        self.assertTrue(any("from 1 seed URL" in w for w in warnings))
+        self.assertTrue(any("expected at least 10" in w for w in warnings))
+
+    def test_warning_when_unvisited_urls_remain_in_queue(self):
+        converter = DocToSkillConverter(self.config, dry_run=True)
+        converter.pages = [{"url": f"https://example.com/p{i}", "title": f"P{i}"} for i in range(15)]
+        converter.pending_urls.clear()
+        converter.pending_urls.extend(["https://example.com/extra1", "https://example.com/extra2"])
+        converter._expansions_count = 5
+
+        warnings = converter._check_coverage()
+        self.assertTrue(any("2 unvisited URL(s) remaining in queue" in w for w in warnings))
+
+    def test_warning_when_no_expansions_occurred(self):
+        config = dict(self.config)
+        config["max_pages"] = 50
+        converter = DocToSkillConverter(config, dry_run=True)
+        converter.pages = [{"url": "https://example.com/", "title": "Home"}]
+        converter.pending_urls.clear()
+        converter._expansions_count = 0
+
+        warnings = converter._check_coverage()
+        self.assertTrue(any("Link discovery mechanism did not find any new URLs" in w for w in warnings))
+
+    def test_no_warning_when_crawling_is_healthy(self):
+        converter = DocToSkillConverter(self.config, dry_run=True)
+        converter.start_urls = ["https://example.com/a", "https://example.com/b"]
+        converter.pages = [{"url": f"https://example.com/p{i}", "title": f"P{i}"} for i in range(25)]
+        converter.pending_urls.clear()
+        converter._expansions_count = 10
+
+        warnings = converter._check_coverage()
+        self.assertEqual(len(warnings), 0)
 
 
 if __name__ == "__main__":

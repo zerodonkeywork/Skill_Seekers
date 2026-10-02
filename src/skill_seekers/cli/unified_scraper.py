@@ -443,10 +443,14 @@ class UnifiedScraper(SkillConverter):
                     "total_pages": summary.get("total_pages", 0),
                     "data_file": docs_data_file,
                     "refs_dir": os.path.join(docs_skill_dir, "references"),
+                    "coverage_warnings": summary.get("coverage_warnings", []),
                 }
             )
 
             logger.info(f"✅ Documentation: {summary.get('total_pages', 0)} pages scraped")
+            if summary.get("coverage_warnings"):
+                for warning in summary["coverage_warnings"]:
+                    logger.warning(warning)
         else:
             logger.warning("Documentation data file not found")
 
@@ -2270,6 +2274,19 @@ class UnifiedScraper(SkillConverter):
                 logger.info("\n" + "=" * 60)
                 logger.info("PHASE 6: Enhancement (skipped - not enabled in config)")
                 logger.info("=" * 60)
+
+            # Display any coverage warnings collected across documentation sources
+            all_coverage_warnings = []
+            for doc_item in self.scraped_data.get("documentation", []):
+                if doc_item.get("coverage_warnings"):
+                    all_coverage_warnings.extend(doc_item["coverage_warnings"])
+            if all_coverage_warnings:
+                logger.warning("\n" + "=" * 60)
+                logger.warning("⚠️  COVERAGE WARNING SUMMARY")
+                logger.warning("=" * 60)
+                for warning in all_coverage_warnings:
+                    logger.warning(warning)
+                logger.warning("=" * 60 + "\n")
 
             logger.info("\n" + "✅ " * 20)
             logger.info("Unified scraping complete!")
